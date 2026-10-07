@@ -37,6 +37,9 @@ shares, _ := c.Instruments(ctx, bvb.Shares)  // also Bonds, FundUnits, Warrants,
 
 // Company details + valuation snapshot (P/E, P/BV, EPS, div yield, ownership, …)
 f, _ := c.Fundamentals(ctx, "TLV")
+
+// Main-market top-5 order book (bids/asks, delayed 15 min; JSON-tagged)
+ob, _ := c.OrderBook(ctx, "ATB")             // ob.Bids[0].Price, ob.Asks[0].Volume, ob.UpdatedAt
 ```
 
 ### As a gobacktest source
@@ -58,6 +61,7 @@ data, _ := src.Fetch(ctx, "TLV", start, end, source.D1)
 | Datafeed config | `Config` → `/api/config` |
 | Instrument universe | `Instruments` → market-list HTML (`Shares`/`Bonds`/`FundUnits`/`Warrants`/`Certificates`) |
 | Company fundamentals + details | `Fundamentals` → detail page (identity, Indicatori bursieri valuation ratios, issue info, ownership); current snapshot only — no multi-year statements |
+| Order book (top 5) | `OrderBook` → detail page's "Tranzactionare" tab via its ASP.NET postback (GET for form state, then POST); main market (REGS), up to 5 levels a side, **delayed 15 min** |
 
 Resolutions map to the constants `M1 M5 M15 M30 H1 D1 W1 Mo1`.
 
@@ -80,6 +84,10 @@ Resolutions map to the constants `M1 M5 M15 M30 H1 D1 W1 Mo1`.
 - **Deep intraday.** A single request carries a bounded number of bars; if a
   long intraday span can't reach `start`, `History` returns `ErrHistoryTruncated`
   instead of a silently shortened series — retry with a coarser resolution.
+- **The order book is behind a postback.** The detail page's plain GET only
+  renders the summary tab; `OrderBook` replays the "Tranzactionare" tab click
+  (`__VIEWSTATE` + `__EVENTVALIDATION` + the tab button, whose GUID changes on
+  every render and is read from the page). No cookies or browser needed.
 
 ## Terms
 

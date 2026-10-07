@@ -13,8 +13,8 @@ import (
 	"time"
 )
 
-// ErrUnknownSymbol is wrapped by SymbolInfo when the datafeed does not know a
-// ticker. Match with errors.Is.
+// ErrUnknownSymbol is wrapped by SymbolInfo, Fundamentals and OrderBook when
+// BVB does not know a ticker. Match with errors.Is.
 var ErrUnknownSymbol = errors.New("bvb: unknown symbol")
 
 const (
@@ -99,6 +99,22 @@ func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
+	return c.do(req, rawURL)
+}
+
+// postForm performs a form-encoded POST (an ASP.NET postback) and returns the
+// response body, or an *APIError on a non-2xx status.
+func (c *Client) postForm(ctx context.Context, rawURL string, form url.Values) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, strings.NewReader(form.Encode()))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	return c.do(req, rawURL)
+}
+
+// do sends req with the client's headers and reads the body.
+func (c *Client) do(req *http.Request, rawURL string) ([]byte, error) {
 	req.Header.Set("User-Agent", c.userAgent)
 	req.Header.Set("Referer", referer)
 	resp, err := c.client.Do(req)
