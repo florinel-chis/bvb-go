@@ -1,6 +1,7 @@
 package bvb
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -21,13 +22,21 @@ const (
 	defaultDatafeedURL = "https://wapi.bvb.ro"
 	defaultWebURL      = "https://www.bvb.ro"
 
-	// userAgent is sent on every request. The endpoints answer generic and
-	// even absent user agents, but a browser-like string guards against a
-	// future WAF rule at no cost.
-	userAgent = "Mozilla/5.0 (compatible; bvb-go)"
-	// referer is sent on datafeed requests to mirror what the site's own
-	// chart sends; the datafeed does not require it today.
+	// userAgent, accept and acceptLanguage make every request look like the
+	// site's own pages loaded in a desktop browser. BVB's backends answer bare
+	// clients today, but they throttle and drop connections under load, and a
+	// browser-like profile is what the site itself is built for.
+	userAgent      = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+	accept         = "text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8"
+	acceptLanguage = "ro-RO,ro;q=0.9,en-US;q=0.8,en;q=0.7"
+	// referer mirrors what the site's own chart and pages send.
 	referer = "https://www.bvb.ro/"
+
+	// Transient-failure retry defaults: 3 attempts, backoff 1s then 2s. A
+	// Retry-After header is honoured up to maxRetryAfter.
+	defaultAttempts = 3
+	defaultBackoff  = time.Second
+	maxRetryAfter   = 10 * time.Second
 
 	// maxErrBody caps how much of a non-2xx response body is carried into an
 	// APIError.
@@ -41,6 +50,8 @@ type Client struct {
 	webURL      string
 	userAgent   string
 	client      *http.Client
+	attempts    int           // total tries per request (>= 1)
+	backoff     time.Duration // first retry delay; doubles each retry
 }
 
 // Option configures a Client.
@@ -64,6 +75,17 @@ func WithWebURL(u string) Option {
 // WithUserAgent overrides the User-Agent header.
 func WithUserAgent(ua string) Option { return func(c *Client) { c.userAgent = ua } }
 
+// WithRetry sets how transient failures are retried: attempts is the total
+// number of tries per request (1 disables retrying) and backoff the first
+// delay, doubled for each further retry. Transient means HTTP 401 (BVB's burst
+// gating), 429, 5xx, or a transport error such as a dropped connection.
+func WithRetry(attempts int, backoff time.Duration) Option {
+	return func(c *Client) {
+		c.attempts = max(1, attempts)
+		c.backoff = max(0, backoff)
+	}
+}
+
 // New returns a Client pointed at BVB's public backends.
 func New(opts ...Option) *Client {
 	c := &Client{
@@ -71,6 +93,8 @@ func New(opts ...Option) *Client {
 		webURL:      defaultWebURL,
 		userAgent:   userAgent,
 		client:      &http.Client{Timeout: 30 * time.Second},
+		attempts:    defaultAttempts,
+		backoff:     defaultBackoff,
 	}
 	for _, o := range opts {
 		o(c)
@@ -95,45 +119,91 @@ func (e *APIError) Error() string {
 // get performs a GET and returns the response body, or an *APIError on a
 // non-2xx status.
 func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
-	if err != nil {
-		return nil, err
-	}
-	return c.do(req, rawURL)
+	return c.do(ctx, http.MethodGet, rawURL, nil, "")
 }
 
 // postForm performs a form-encoded POST (an ASP.NET postback) and returns the
 // response body, or an *APIError on a non-2xx status.
 func (c *Client) postForm(ctx context.Context, rawURL string, form url.Values) ([]byte, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, rawURL, strings.NewReader(form.Encode()))
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-	return c.do(req, rawURL)
+	return c.do(ctx, http.MethodPost, rawURL, []byte(form.Encode()), "application/x-www-form-urlencoded")
 }
 
-// do sends req with the client's headers and reads the body.
-func (c *Client) do(req *http.Request, rawURL string) ([]byte, error) {
+// do sends a request with the client's browser-like headers, retrying
+// transient failures with exponential backoff, and returns the body. Each
+// attempt builds a fresh request, so a POST body is re-sent intact. The
+// context bounds the whole call, backoff included.
+func (c *Client) do(ctx context.Context, method, rawURL string, body []byte, contentType string) ([]byte, error) {
+	delay := c.backoff
+	for attempt := 1; ; attempt++ {
+		out, retryAfter, err := c.once(ctx, method, rawURL, body, contentType)
+		if err == nil || attempt >= c.attempts || !transient(err) || ctx.Err() != nil {
+			return out, err
+		}
+		wait := delay
+		if retryAfter > 0 {
+			wait = min(retryAfter, maxRetryAfter)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(wait):
+		}
+		delay *= 2
+	}
+}
+
+// once performs a single attempt. retryAfter is the server's Retry-After hint
+// (0 if absent or unparsable).
+func (c *Client) once(ctx context.Context, method, rawURL string, body []byte, contentType string) (out []byte, retryAfter time.Duration, err error) {
+	var reader io.Reader
+	if body != nil {
+		reader = bytes.NewReader(body)
+	}
+	req, err := http.NewRequestWithContext(ctx, method, rawURL, reader)
+	if err != nil {
+		return nil, 0, err
+	}
 	req.Header.Set("User-Agent", c.userAgent)
+	req.Header.Set("Accept", accept)
+	req.Header.Set("Accept-Language", acceptLanguage)
 	req.Header.Set("Referer", referer)
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	resp, err := c.client.Do(req)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
+	data, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		msg := string(body)
+		msg := string(data)
 		if len(msg) > maxErrBody {
 			msg = msg[:maxErrBody]
 		}
-		return nil, &APIError{Status: resp.StatusCode, URL: rawURL, Body: msg}
+		if secs, perr := strconv.Atoi(strings.TrimSpace(resp.Header.Get("Retry-After"))); perr == nil && secs > 0 {
+			retryAfter = time.Duration(secs) * time.Second
+		}
+		return nil, retryAfter, &APIError{Status: resp.StatusCode, URL: rawURL, Body: msg}
 	}
-	return body, nil
+	return data, 0, nil
+}
+
+// transient reports whether err is worth retrying: BVB's burst gating (401),
+// rate limiting (429), server errors (5xx) and transport failures. Other HTTP
+// errors (e.g. 404) and context cancellation are final.
+func transient(err error) bool {
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	var apiErr *APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.Status == http.StatusUnauthorized || apiErr.Status == http.StatusTooManyRequests || apiErr.Status >= 500
+	}
+	return true // transport error: connection reset, EOF, timeout, …
 }
 
 // getJSON performs a GET and JSON-decodes the body into dst.

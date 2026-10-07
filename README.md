@@ -75,10 +75,14 @@ Resolutions map to the constants `M1 M5 M15 M30 H1 D1 W1 Mo1`.
 - **Indices** are not part of `Instruments` (different page shape), but index
   candles are reachable through `History`/`SymbolInfo` by their datafeed symbol
   (e.g. `BET`).
-- **Transient gating.** Under bursty access the datafeed can briefly answer
-  `HTTP 401 "Authorization has been denied for this request."`; it clears on
-  its own. `History`/etc. surface this as an `*APIError` (whose message
-  includes the response body) — space out large multi-symbol scans.
+- **Browser-like requests, transient gating retried.** Every request carries a
+  desktop-Chrome `User-Agent`, `Accept`, `Accept-Language` and
+  `Referer: https://www.bvb.ro/`. Under bursty access BVB can briefly answer
+  `HTTP 401 "Authorization has been denied for this request."`, rate-limit
+  (429), fail (5xx) or drop the connection; those are retried automatically
+  (3 attempts, 1 s → 2 s backoff, `Retry-After` honoured, context-aware). Tune
+  with `WithRetry(attempts, backoff)`; anything else (e.g. 404) fails at once
+  as an `*APIError`.
 - **Unknown tickers** come back as HTTP 200 with an empty body; `SymbolInfo`
   reports them as `ErrUnknownSymbol` rather than a blank struct.
 - **Deep intraday.** A single request carries a bounded number of bars; if a

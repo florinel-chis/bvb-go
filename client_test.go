@@ -334,7 +334,9 @@ func TestAPIError(t *testing.T) {
 		http.Error(w, "boom", http.StatusInternalServerError)
 	}))
 	defer srv.Close()
-	c := New(WithDatafeedURL(srv.URL), WithHTTPClient(srv.Client()))
+	// One attempt: this checks how an HTTP error surfaces; retrying is covered
+	// in retry_test.go.
+	c := New(WithDatafeedURL(srv.URL), WithHTTPClient(srv.Client()), WithRetry(1, 0))
 	_, err := c.Config(context.Background())
 	var apiErr *APIError
 	if !errors.As(err, &apiErr) {
